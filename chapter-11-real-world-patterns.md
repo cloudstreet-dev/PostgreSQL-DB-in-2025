@@ -4,6 +4,177 @@
 
 After ten chapters of theory and practice, let's tackle the patterns that separate production systems from prototypes. These are the lessons learned from millions of queries, terabytes of data, and countless 3 AM incidents.
 
+## The UUID vs Serial ID Debate
+
+One of the first decisions in any database design: how do you identify your records?
+
+### Serial IDs (Traditional Approach)
+
+```sql
+-- Simple incrementing integers
+CREATE TABLE users_serial (
+    id SERIAL PRIMARY KEY,  -- or BIGSERIAL for larger ranges
+    email TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Pros:
+-- ✓ Small size (4 bytes for INT, 8 bytes for BIGINT)
+-- ✓ Fast indexing and joins
+-- ✓ Human-readable (easy debugging)
+-- ✓ Natural ordering by creation time
+-- ✓ Better index locality (sequential inserts)
+
+-- Cons:
+-- ✗ Reveals business information (user count, growth rate)
+-- ✗ Enumerable (security risk for public APIs)
+-- ✗ Not globally unique across databases
+-- ✗ Difficult to merge/shard databases
+-- ✗ Can't generate IDs client-side
+```
+
+### UUIDs (Distributed-Friendly)
+
+```sql
+-- Universally Unique Identifiers
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+CREATE TABLE users_uuid (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    email TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Alternative: gen_random_uuid() in PostgreSQL 13+
+CREATE TABLE users_uuid_v2 (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    email TEXT UNIQUE NOT NULL
+);
+
+-- Pros:
+-- ✓ Globally unique across all systems
+-- ✓ Can generate IDs anywhere (client, server, offline)
+-- ✓ No information leakage
+-- ✓ Easy database merging/sharding
+-- ✓ No central coordination needed
+
+-- Cons:
+-- ✗ Larger size (16 bytes)
+-- ✗ Harder to read/debug (not human-friendly)
+-- ✗ Random insertion pattern (index fragmentation)
+-- ✗ No natural time ordering
+-- ✗ Slightly slower joins
+```
+
+### Hybrid Approach: Best of Both Worlds
+
+```sql
+-- Internal serial ID for joins, public UUID for APIs
+CREATE TABLE users_hybrid (
+    id BIGSERIAL PRIMARY KEY,                         -- Internal use only
+    public_id UUID DEFAULT gen_random_uuid() UNIQUE,  -- External API
+    email TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Indexes
+CREATE INDEX idx_users_public_id ON users_hybrid(public_id);
+
+-- Internal queries use fast integer joins
+SELECT o.*
+FROM orders o
+JOIN users_hybrid u ON o.user_id = u.id
+WHERE u.email = 'user@example.com';
+
+-- API exposes only UUIDs
+SELECT public_id, email FROM users_hybrid
+WHERE public_id = '550e8400-e29b-41d4-a716-446655440000';
+```
+
+### Advanced: Ordered UUIDs (ULIDs/UUID v6/v7)
+
+```sql
+-- ULID: Universally Unique Lexicographically Sortable Identifier
+CREATE OR REPLACE FUNCTION generate_ulid()
+RETURNS TEXT AS $$
+DECLARE
+    timestamp BIGINT;
+    random_part TEXT;
+BEGIN
+    -- Timestamp in milliseconds (48 bits)
+    timestamp := EXTRACT(EPOCH FROM NOW() * 1000)::BIGINT;
+
+    -- Random part (80 bits)
+    random_part := encode(gen_random_bytes(10), 'hex');
+
+    -- Combine and encode (base32 for real ULID)
+    RETURN lpad(to_hex(timestamp), 12, '0') || random_part;
+END;
+$$ LANGUAGE plpgsql;
+
+-- UUID v7 (time-ordered UUID) - coming in PostgreSQL 17
+-- For now, use a custom implementation
+CREATE OR REPLACE FUNCTION uuid_generate_v7()
+RETURNS UUID AS $$
+DECLARE
+    unix_ts_ms BIGINT;
+    uuid_bytes BYTEA;
+BEGIN
+    unix_ts_ms := EXTRACT(EPOCH FROM NOW() * 1000)::BIGINT;
+
+    -- Timestamp (48 bits) + version (4 bits) + random (74 bits)
+    uuid_bytes :=
+        int8send(unix_ts_ms << 16) ||  -- Timestamp
+        gen_random_bytes(10);           -- Random
+
+    -- Set version (7) and variant bits
+    uuid_bytes := set_byte(uuid_bytes, 6,
+        (get_byte(uuid_bytes, 6) & 15) | 112);  -- Version 7
+    uuid_bytes := set_byte(uuid_bytes, 8,
+        (get_byte(uuid_bytes, 8) & 63) | 128);  -- Variant
+
+    RETURN encode(uuid_bytes, 'hex')::UUID;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Usage: Time-ordered but still globally unique
+CREATE TABLE events (
+    id UUID DEFAULT uuid_generate_v7() PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    payload JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Benefits: Sequential insertion pattern like serial IDs
+-- but with global uniqueness like UUIDs
+```
+
+### Decision Matrix
+
+```sql
+-- Choose Serial IDs when:
+-- • Internal system with no public API
+-- • Performance is critical
+-- • Database will never be sharded
+-- • IDs never exposed to users
+
+-- Choose UUIDs when:
+-- • Building distributed systems
+-- • Need client-side ID generation
+-- • Public API exposes IDs
+-- • Planning for database sharding
+
+-- Choose Hybrid when:
+-- • Need both performance and security
+-- • Willing to manage complexity
+-- • Have clear internal/external boundaries
+
+-- Choose Ordered UUIDs when:
+-- • Need UUID benefits
+-- • But also want better index performance
+-- • Time-ordering is useful
+```
+
 ## Multi-Tenancy Patterns
 
 ### Schema-per-Tenant

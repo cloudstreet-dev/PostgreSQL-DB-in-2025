@@ -1025,6 +1025,288 @@ WHERE ST_DWithin(
 );
 ```
 
+## Table Inheritance
+
+PostgreSQL supports object-oriented concepts through table inheritance.
+
+```sql
+-- Base table
+CREATE TABLE vehicles (
+    id SERIAL PRIMARY KEY,
+    make TEXT NOT NULL,
+    model TEXT NOT NULL,
+    year INTEGER NOT NULL,
+    color TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Child tables inherit all columns
+CREATE TABLE cars (
+    doors INTEGER NOT NULL,
+    fuel_type TEXT
+) INHERITS (vehicles);
+
+CREATE TABLE motorcycles (
+    engine_cc INTEGER,
+    has_sidecar BOOLEAN DEFAULT FALSE
+) INHERITS (vehicles);
+
+-- Insert into child tables
+INSERT INTO cars (make, model, year, color, doors, fuel_type)
+VALUES ('Toyota', 'Camry', 2024, 'Blue', 4, 'Hybrid');
+
+INSERT INTO motorcycles (make, model, year, color, engine_cc, has_sidecar)
+VALUES ('Harley-Davidson', 'Street 750', 2023, 'Black', 750, FALSE);
+
+-- Query parent table shows all records
+SELECT * FROM vehicles;  -- Shows both cars and motorcycles
+
+-- Query only specific type
+SELECT * FROM ONLY vehicles;  -- Only direct inserts to vehicles
+SELECT * FROM cars;          -- Only cars
+
+-- Add constraint to parent affects children
+ALTER TABLE vehicles ADD CHECK (year >= 1900);
+
+-- Caveats: Primary keys and unique constraints don't inherit
+-- Need to create separately on each child table
+```
+
+## Foreign Data Wrappers
+
+Access external data sources as if they were PostgreSQL tables.
+
+### PostgreSQL to PostgreSQL
+
+```sql
+-- Install extension
+CREATE EXTENSION postgres_fdw;
+
+-- Create server connection
+CREATE SERVER remote_db
+FOREIGN DATA WRAPPER postgres_fdw
+OPTIONS (host 'remote.example.com', port '5432', dbname 'remote_db');
+
+-- Create user mapping
+CREATE USER MAPPING FOR current_user
+SERVER remote_db
+OPTIONS (user 'remote_user', password 'secret_password');
+
+-- Import foreign schema
+IMPORT FOREIGN SCHEMA public
+LIMIT TO (users, orders, products)
+FROM SERVER remote_db
+INTO local_schema;
+
+-- Query remote tables
+SELECT * FROM local_schema.users;
+
+-- Join local and remote tables
+SELECT l.*, r.order_count
+FROM local_customers l
+JOIN local_schema.users r ON l.email = r.email;
+```
+
+### CSV Files as Tables
+
+```sql
+-- Install file FDW
+CREATE EXTENSION file_fdw;
+
+-- Create server
+CREATE SERVER csv_files FOREIGN DATA WRAPPER file_fdw;
+
+-- Create foreign table for CSV
+CREATE FOREIGN TABLE sales_import (
+    date DATE,
+    product_id INTEGER,
+    quantity INTEGER,
+    amount DECIMAL(10,2)
+) SERVER csv_files
+OPTIONS (
+    filename '/data/imports/sales_2024.csv',
+    format 'csv',
+    header 'true'
+);
+
+-- Query CSV file like a table
+SELECT * FROM sales_import WHERE date >= '2024-01-01';
+
+-- Load into permanent table
+INSERT INTO sales (date, product_id, quantity, amount)
+SELECT * FROM sales_import
+WHERE date NOT IN (SELECT date FROM sales);
+```
+
+### MongoDB Integration
+
+```sql
+-- Install MongoDB FDW
+CREATE EXTENSION mongo_fdw;
+
+-- Create server
+CREATE SERVER mongodb_server
+FOREIGN DATA WRAPPER mongo_fdw
+OPTIONS (address 'mongodb.example.com', port '27017');
+
+-- Create user mapping
+CREATE USER MAPPING FOR current_user
+SERVER mongodb_server
+OPTIONS (username 'mongo_user', password 'mongo_pass');
+
+-- Create foreign table
+CREATE FOREIGN TABLE mongo_products (
+    _id NAME,
+    name TEXT,
+    price NUMERIC,
+    categories TEXT[],
+    specs JSONB
+) SERVER mongodb_server
+OPTIONS (database 'store', collection 'products');
+
+-- Query MongoDB from PostgreSQL
+SELECT name, price, specs->>'color' AS color
+FROM mongo_products
+WHERE price > 100;
+```
+
+## LISTEN/NOTIFY - Real-time Events
+
+PostgreSQL's built-in pub/sub system for real-time notifications.
+
+```sql
+-- Create notification trigger
+CREATE OR REPLACE FUNCTION notify_order_status_change()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Send notification with payload
+    PERFORM pg_notify(
+        'order_status_changed',
+        json_build_object(
+            'order_id', NEW.id,
+            'old_status', OLD.status,
+            'new_status', NEW.status,
+            'customer_id', NEW.customer_id,
+            'timestamp', NOW()
+        )::text
+    );
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach trigger to orders table
+CREATE TRIGGER order_status_change_trigger
+AFTER UPDATE OF status ON orders
+FOR EACH ROW
+WHEN (OLD.status IS DISTINCT FROM NEW.status)
+EXECUTE FUNCTION notify_order_status_change();
+
+-- In application code (Python example):
+-- import psycopg2
+-- conn = psycopg2.connect(...)
+-- conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+-- cur = conn.cursor()
+-- cur.execute("LISTEN order_status_changed;")
+--
+-- while True:
+--     conn.poll()
+--     while conn.notifies:
+--         notify = conn.notifies.pop(0)
+--         print(f"Got notification: {notify.payload}")
+
+-- SQL client can listen too
+LISTEN order_status_changed;
+
+-- In another session, update an order
+UPDATE orders SET status = 'shipped' WHERE id = 123;
+
+-- First session receives:
+-- Asynchronous notification "order_status_changed" with payload
+-- "{"order_id": 123, "old_status": "processing", "new_status": "shipped", ...}"
+```
+
+### Real-time Dashboard Example
+
+```sql
+-- Create comprehensive notification system
+CREATE OR REPLACE FUNCTION notify_dashboard_event()
+RETURNS TRIGGER AS $$
+DECLARE
+    channel TEXT;
+    payload JSONB;
+BEGIN
+    -- Determine channel based on table
+    channel := CASE TG_TABLE_NAME
+        WHEN 'orders' THEN 'dashboard_orders'
+        WHEN 'users' THEN 'dashboard_users'
+        WHEN 'products' THEN 'dashboard_products'
+        ELSE 'dashboard_general'
+    END;
+
+    -- Build payload
+    payload := jsonb_build_object(
+        'operation', TG_OP,
+        'table', TG_TABLE_NAME,
+        'timestamp', NOW(),
+        'user', current_user,
+        'data', CASE
+            WHEN TG_OP = 'DELETE' THEN to_jsonb(OLD)
+            WHEN TG_OP = 'UPDATE' THEN jsonb_build_object(
+                'old', to_jsonb(OLD),
+                'new', to_jsonb(NEW)
+            )
+            ELSE to_jsonb(NEW)
+        END
+    );
+
+    -- Send notification
+    PERFORM pg_notify(channel, payload::text);
+
+    -- Return appropriate value
+    RETURN CASE
+        WHEN TG_OP = 'DELETE' THEN OLD
+        ELSE NEW
+    END;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Apply to multiple tables
+CREATE TRIGGER dashboard_trigger
+AFTER INSERT OR UPDATE OR DELETE ON orders
+FOR EACH ROW EXECUTE FUNCTION notify_dashboard_event();
+
+CREATE TRIGGER dashboard_trigger
+AFTER INSERT OR UPDATE OR DELETE ON users
+FOR EACH ROW EXECUTE FUNCTION notify_dashboard_event();
+
+-- Rate limiting notifications
+CREATE OR REPLACE FUNCTION notify_with_throttle()
+RETURNS TRIGGER AS $$
+DECLARE
+    last_notification TIMESTAMP;
+BEGIN
+    -- Check last notification time
+    SELECT last_notified INTO last_notification
+    FROM notification_throttle
+    WHERE channel = 'high_volume_channel';
+
+    IF last_notification IS NULL OR
+       last_notification < NOW() - INTERVAL '1 second' THEN
+        -- Send notification
+        PERFORM pg_notify('high_volume_channel', to_jsonb(NEW)::text);
+
+        -- Update throttle
+        INSERT INTO notification_throttle (channel, last_notified)
+        VALUES ('high_volume_channel', NOW())
+        ON CONFLICT (channel)
+        DO UPDATE SET last_notified = NOW();
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
 ## Exercises
 
 ### Exercise 6.1: JSON Operations

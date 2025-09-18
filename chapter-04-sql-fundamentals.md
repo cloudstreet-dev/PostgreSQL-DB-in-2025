@@ -1213,6 +1213,246 @@ SELECT DISTINCT p.* FROM products p, order_items oi;
 SELECT p.* FROM products p JOIN order_items oi ON p.id = oi.product_id;
 ```
 
+## Common Table Expressions (CTEs)
+
+CTEs make complex queries readable by breaking them into named, reusable parts.
+
+### Basic CTE
+
+```sql
+-- Calculate order statistics in steps
+WITH order_stats AS (
+    SELECT
+        customer_id,
+        COUNT(*) as order_count,
+        SUM(total_amount) as total_spent,
+        AVG(total_amount) as avg_order_value
+    FROM orders
+    WHERE status = 'completed'
+    GROUP BY customer_id
+)
+SELECT
+    c.first_name || ' ' || c.last_name as customer_name,
+    os.order_count,
+    os.total_spent,
+    os.avg_order_value
+FROM order_stats os
+JOIN customers c ON c.id = os.customer_id
+WHERE os.order_count > 5
+ORDER BY os.total_spent DESC;
+```
+
+### Multiple CTEs
+
+```sql
+-- Analyze customer behavior with multiple steps
+WITH
+customer_orders AS (
+    SELECT
+        customer_id,
+        COUNT(*) as order_count,
+        MAX(created_at) as last_order_date
+    FROM orders
+    GROUP BY customer_id
+),
+customer_categories AS (
+    SELECT
+        customer_id,
+        CASE
+            WHEN order_count >= 10 THEN 'VIP'
+            WHEN order_count >= 5 THEN 'Regular'
+            ELSE 'New'
+        END as category
+    FROM customer_orders
+)
+SELECT
+    cc.category,
+    COUNT(*) as customer_count,
+    AVG(co.order_count) as avg_orders
+FROM customer_categories cc
+JOIN customer_orders co ON cc.customer_id = co.customer_id
+GROUP BY cc.category;
+```
+
+### Recursive CTEs
+
+```sql
+-- Build organizational hierarchy
+WITH RECURSIVE org_chart AS (
+    -- Anchor: Start with CEO
+    SELECT
+        id,
+        name,
+        manager_id,
+        0 as level,
+        name as path
+    FROM employees
+    WHERE manager_id IS NULL
+
+    UNION ALL
+
+    -- Recursive: Add direct reports
+    SELECT
+        e.id,
+        e.name,
+        e.manager_id,
+        oc.level + 1,
+        oc.path || ' → ' || e.name
+    FROM employees e
+    JOIN org_chart oc ON e.manager_id = oc.id
+)
+SELECT
+    repeat('  ', level) || name as org_structure,
+    level
+FROM org_chart
+ORDER BY path;
+
+-- Find all subcategories
+WITH RECURSIVE category_tree AS (
+    SELECT id, name, parent_id, name as full_path
+    FROM categories
+    WHERE parent_id IS NULL
+
+    UNION ALL
+
+    SELECT c.id, c.name, c.parent_id, ct.full_path || ' > ' || c.name
+    FROM categories c
+    JOIN category_tree ct ON c.parent_id = ct.id
+)
+SELECT * FROM category_tree ORDER BY full_path;
+```
+
+## Window Functions
+
+Window functions perform calculations across rows while keeping individual row details.
+
+### Ranking Functions
+
+```sql
+-- Rank products by sales within each category
+SELECT
+    category_id,
+    name,
+    units_sold,
+    ROW_NUMBER() OVER (PARTITION BY category_id ORDER BY units_sold DESC) as row_num,
+    RANK() OVER (PARTITION BY category_id ORDER BY units_sold DESC) as rank,
+    DENSE_RANK() OVER (PARTITION BY category_id ORDER BY units_sold DESC) as dense_rank,
+    PERCENT_RANK() OVER (PARTITION BY category_id ORDER BY units_sold DESC) as pct_rank
+FROM products;
+
+-- Top 3 products per category
+WITH ranked_products AS (
+    SELECT
+        category_id,
+        name,
+        price,
+        ROW_NUMBER() OVER (PARTITION BY category_id ORDER BY price DESC) as rn
+    FROM products
+)
+SELECT * FROM ranked_products WHERE rn <= 3;
+```
+
+### Aggregate Window Functions
+
+```sql
+-- Running totals and moving averages
+SELECT
+    order_date,
+    total_amount,
+    -- Running total
+    SUM(total_amount) OVER (ORDER BY order_date) as running_total,
+    -- 7-day moving average
+    AVG(total_amount) OVER (
+        ORDER BY order_date
+        ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+    ) as moving_avg_7d,
+    -- Month-to-date total
+    SUM(total_amount) OVER (
+        PARTITION BY DATE_TRUNC('month', order_date)
+        ORDER BY order_date
+    ) as month_to_date
+FROM orders;
+
+-- Compare each sale to department average
+SELECT
+    department_id,
+    employee_name,
+    sale_amount,
+    AVG(sale_amount) OVER (PARTITION BY department_id) as dept_avg,
+    sale_amount - AVG(sale_amount) OVER (PARTITION BY department_id) as diff_from_avg,
+    sale_amount::numeric / NULLIF(AVG(sale_amount) OVER (PARTITION BY department_id), 0) as pct_of_avg
+FROM sales;
+```
+
+### Lead and Lag
+
+```sql
+-- Compare with previous and next values
+SELECT
+    order_date,
+    customer_id,
+    total_amount,
+    LAG(total_amount, 1) OVER (PARTITION BY customer_id ORDER BY order_date) as prev_order,
+    LEAD(total_amount, 1) OVER (PARTITION BY customer_id ORDER BY order_date) as next_order,
+    total_amount - LAG(total_amount, 1) OVER (PARTITION BY customer_id ORDER BY order_date) as change_from_prev
+FROM orders;
+
+-- Calculate time between orders
+SELECT
+    customer_id,
+    order_date,
+    order_date - LAG(order_date) OVER (PARTITION BY customer_id ORDER BY order_date) as days_since_last
+FROM orders;
+```
+
+### First and Last Value
+
+```sql
+-- Show first and last order for each customer
+SELECT DISTINCT
+    customer_id,
+    FIRST_VALUE(order_date) OVER (
+        PARTITION BY customer_id
+        ORDER BY order_date
+        RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) as first_order,
+    LAST_VALUE(order_date) OVER (
+        PARTITION BY customer_id
+        ORDER BY order_date
+        RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) as last_order
+FROM orders;
+```
+
+### NTILE and Distribution
+
+```sql
+-- Divide customers into quartiles by spending
+SELECT
+    customer_id,
+    total_spent,
+    NTILE(4) OVER (ORDER BY total_spent) as spending_quartile,
+    CASE NTILE(4) OVER (ORDER BY total_spent)
+        WHEN 1 THEN 'Bottom 25%'
+        WHEN 2 THEN 'Lower Middle'
+        WHEN 3 THEN 'Upper Middle'
+        WHEN 4 THEN 'Top 25%'
+    END as segment
+FROM (
+    SELECT customer_id, SUM(total_amount) as total_spent
+    FROM orders
+    GROUP BY customer_id
+) customer_totals;
+
+-- Cumulative distribution
+SELECT
+    name,
+    salary,
+    CUME_DIST() OVER (ORDER BY salary) as cumulative_distribution,
+    ROUND(CUME_DIST() OVER (ORDER BY salary) * 100) as percentile
+FROM employees;
+```
+
 ## Exercises
 
 ### Exercise 4.1: Basic Queries
